@@ -1,175 +1,90 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+"""
+FastAPI service: mail-ollama-extractor
+- Receives plain-text "email + attachment" body plus optional subject/received_at/graph_id.
+- Classifies → {category, priority}.
+- If Invoice → extracts invoice fields (incl. short 'description').
+- If Customer Requests → summary (model) + deterministic ticket number (code).
+- Returns JSON only. No persistence here (caller updates Dataverse).
+"""
+
+import logging
+from typing import Dict, Any
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-import os, re
 
-from extractors import extract_attachment_text
-from llm import (
-    classify_mail, extract_invoice, extract_meeting, extract_timesheet, extract_request,
-    Classification
-)
-from dataverse_client import create_row, col
-from datetime import datetime
-import re
-
-def ensure_ddmmyyyy(s: str | None) -> str | None:
-    if not s: 
-        return None
-    s = s.strip()
-    # Try common formats and coerce to dd-mm-yyyy
-    for fmt in ("%d-%m-%Y","%Y-%m-%d","%d/%m/%Y","%d %b %Y","%d %B %Y"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%d-%m-%Y")
-        except Exception:
-            pass
-    # Last-ditch: pick day/month/year in text
-    m = re.search(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', s)
-    if m:
-        d, mth, y = m.groups()
-        return f"{int(d):02d}-{int(mth):02d}-{y}"
-    return s  # leave as-is if we can't parse
+from schemas import ExtractIn, ExtractOut
+from llm import classify_text, extract_invoice, extract_customer_request_summary
+from utils import trim_text, yyyymmdd_from_iso, compute_ticket
 
 load_dotenv()
 
-app = FastAPI(title="Mail LLM Extractor")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("mail-ollama-extractor")
+
+app = FastAPI(title="mail-ollama-extractor", version="1.2.0")
 
 @app.get("/")
+def root():
+    return {"ok": True, "service": "mail-ollama-extractor"}
+
+@app.get("/health")
 def health():
-    return {"ok": True, "message": "API running"}
+    return {"ok": True}
 
-class Attachment(BaseModel):
-    filename: str
-    content_base64: str
+@app.post("/extract", response_model=ExtractOut)
+def extract(payload: ExtractIn):
+    """
+    Contract:
+      - We receive body_text (plain text of email + attachments).
+      - Optional: subject, received_at (ISO), graph_id (Graph message id).
+      - Step 1: classify → category, priority (deterministic, seeded).
+      - Step 2:
+            * Invoice           → extract invoice fields (incl. description)
+            * Customer Requests → summary (model) + ticket_number (code; deterministic)
+            * General / Misc    → nothing else
+    """
+    try:
+        if not payload.body_text or not payload.body_text.strip():
+            raise HTTPException(status_code=422, detail="body_text is required")
 
-class MailIn(BaseModel):
-    subject: str
-    sender: str
-    body_html: Optional[str] = ""
-    body_text: Optional[str] = ""
-    received_at: Optional[str] = None  # ISO
-    attachments: List[Attachment] = []
-    push_to_dataverse: bool = True
+        # Keep context bounded; let models see the subject if provided
+        text = trim_text(payload.body_text.strip())
+        if payload.subject:
+            text = f"Subject: {payload.subject}\n\n{text}"
 
-def _normalize_body(m: MailIn) -> str:
-    body = (m.body_text or "") + "\n" + (m.body_html or "")
-    return body.strip()
+        # 1) Classify (strict JSON; deterministic by seed)
+        cls = classify_text(text, graph_id=payload.graph_id)
+        cat = (cls.category or "").strip()
+        pr  = (cls.priority or "").strip()
+        cat_norm = cat.lower()
 
-def _regex_invoice_fallback(text: str) -> dict:
-    # Helpful sanity check if LLM misses critical fields
-    bsb = None
-    acc = None
-    amt = None
-    # BSB: 6 digits with optional hyphen
-    m = re.search(r"\b(?:BSB[:\s]*)?(\d{3}[-\s]?\d{3})\b", text, re.I)
-    if m: bsb = m.group(1)
-    # Account number: 6-12 digits heuristic
-    m = re.search(r"\b(?:account(?:\s*no\.?| number)[:\s]*)?(\d{6,12})\b", text, re.I)
-    if m: acc = m.group(1)
-    # Amount: AUD with $ or numbers
-    m = re.search(r"\b(?:total|amount due|amount)\s*[:$]?\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})\b", text, re.I)
-    if m: amt = float(m.group(1).replace(",",""))
-    return {"bsb": bsb, "account_number": acc, "invoice_amount": amt}
+        out: Dict[str, Any] = {"category": cat, "priority": pr}
 
-def _regex_invoice_number(text: str, subject: str) -> Optional[str]:
-    pats = [
-        r"(?i)\b(?:invoice|inv|tax\s*invoice|reference|ref)\s*(?:no\.?|number|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/]{2,})",
-        r"(?i)\b(INV[-_/]?[A-Z0-9]{2,})\b",
-    ]
-    for p in pats:
-        m = re.search(p, subject) or re.search(p, text)
-        if m:
-            val = m.group(1).strip().rstrip(".,)")
-            return val[:40]
-    return None
+        # 2) Extract per category
+        if cat_norm in ("invoice", "invoices"):
+            out["invoice"] = extract_invoice(text, graph_id=payload.graph_id).model_dump()
 
-@app.post("/extract")
-def extract(m: MailIn):
-    attach_text, names_csv = extract_attachment_text([(a.filename, a.content_base64) for a in m.attachments])
-    text_blob = "\n\n".join([_normalize_body(m), attach_text]).strip()
+        elif cat_norm in ("customer requests", "customer request"):
+            # a) concise summary (deterministic)
+            summary = extract_customer_request_summary(text, graph_id=payload.graph_id).summary
+            # b) deterministic ticket number
+            date = yyyymmdd_from_iso(payload.received_at)
+            ticket = compute_ticket(date_yyyymmdd=date, seed=(payload.graph_id or ""))
+            out["request"] = {"summary": summary, "ticket_number": ticket}
 
-    # 1) classify
-    cls: Classification = classify_mail(text_blob)
+        # general / misc → no extras
+        return {"ok": True, "data": out}
 
-    # 2) per-category extraction
-    category = cls.category
-    result: Dict[str, Any] = {"category": category, "priority": cls.priority}
-
-    inv = meet = ts = req = None
-    if category == "Invoices":
-        inv = extract_invoice(text_blob).model_dump()
-        fb = _regex_invoice_fallback(text_blob)
-        for k, v in fb.items():
-            if (inv.get(k) is None) and v is not None:
-                inv[k] = v
-        invnum = _regex_invoice_number(text_blob, m.subject)
-        if not inv.get("invoice_number") and invnum:
-            inv["invoice_number"] = invnum
-        result["invoice"] = inv
-    elif category == "Meeting Requests":
-        meet = extract_meeting(text_blob).model_dump()
-        # normalize online
-        if meet.get("meeting_link") and not meet.get("location"):
-            meet["location"] = "Online"
-        result["meeting"] = meet
-    elif category == "Timesheets":
-        ts = extract_timesheet(text_blob).model_dump()
-        result["timesheet"] = ts
-    elif category in ("Customer Requests","Team Member Requests"):
-        req = extract_request(text_blob).model_dump()
-        result["request"] = req
-
-    # 3) optionally push to Dataverse as new row
-    if m.push_to_dataverse:
-        payload = {
-          col("COL_SUBJECT"): m.subject,
-          col("COL_SENDER"): m.sender,
-          col("COL_RECEIVED_AT"): m.received_at,
-          col("COL_CATEGORY"): category,
-          col("COL_PRIORITY"): cls.priority,
-          col("COL_ATTACHMENT_TEXT"): text_blob[:900000],  # safeguard
-          col("COL_ATTACHMENT_NAMES"): names_csv,
-          col("COL_SUMMARY"): (req or meet or inv or ts or {}),  # dump in Summary JSON column if you have one
-        }
-        # invoice specifics (+ default paid=false)
-        if inv:
-            payload.update({
-            col("COL_INV_DUE_DATE"): ensure_ddmmyyyy(inv.get("due_date")),
-            col("COL_INV_NUMBER"): inv.get("invoice_number"),
-            col("COL_INV_DATE"): ensure_ddmmyyyy(inv.get("invoice_date")),
-            col("COL_INV_AMOUNT"): inv.get("invoice_amount"),
-            col("COL_INV_BSB"): inv.get("bsb"),
-            col("COL_INV_ACC_NO"): inv.get("account_number"),
-            col("COL_INV_ACC_NAME"): inv.get("account_name"),
-            col("COL_INV_PAYMENT_LINK"): inv.get("payment_link"),
-            col("COL_PAID"): False,
-            })
-
-        if meet:
-            payload.update({
-            col("COL_MEET_DATE"): ensure_ddmmyyyy(meet.get("date")),
-            col("COL_MEET_TIME"): meet.get("time"),
-            col("COL_MEET_LOCATION"): meet.get("location"),
-            col("COL_MEET_LINK"): meet.get("meeting_link"),
-            })
-
-        if ts:
-            payload.update({
-            col("COL_TS_START"): ensure_ddmmyyyy(ts.get("period_start")),
-            col("COL_TS_END"): ensure_ddmmyyyy(ts.get("period_end")),
-            col("COL_TS_AL"): ts.get("annual_leave_hours"),
-            col("COL_TS_PL"): ts.get("personal_leave_hours"),
-            col("COL_TS_TOTAL"): ts.get("total_hours"),
-            col("COL_TS_APPROVAL_LINKS"): ", ".join(ts.get("approval_links") or []),
-            })
-        if req:
-            payload.update({
-              col("COL_REQ_TITLE"): req.get("title"),
-              col("COL_REQ_OVERVIEW"): req.get("overview"),
-              col("COL_REQ_NUMBER"): req.get("request_number"),
-            })
-        # remove None keys
-        payload = {k:v for k,v in payload.items() if k and v is not None}
-        create_row(payload)
-
-    return {"ok": True, "data": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Extractor failed")
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": f"Extractor failed: {e}"}
+        )
