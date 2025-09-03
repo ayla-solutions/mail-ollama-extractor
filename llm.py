@@ -1,21 +1,21 @@
 """
-Ollama integration with strict JSON outputs.
-- Deterministic: temperature=0.0 + per-request seed (graph_id + text).
-- Robust JSON parsing: strips code fences and extracts the first complete JSON value.
-- Invoice: includes short 'description' derived from items/particulars.
-- Customer Request: we only ask for a summary; ticket numbers are computed in code.
+Ollama integration with strict JSON outputs and deterministic seeding.
+Upgrades:
+- Stronger classification prompt (exact allowed categories/priorities + casing).
+- Separate caps for classify vs extract (faster).
+- Invoice fallback regex parser to fill missing fields.
 """
 
 import json
 import os
-import re
 from typing import Dict, Any, Optional, Literal, Type
 
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import ollama
+import re
 
-from utils import trim_text
+from utils import trim_text, title_case, MAX_CHARS_CLASSIFY, MAX_CHARS_EXTRACT
 
 load_dotenv()
 
@@ -60,7 +60,7 @@ def _det_seed(graph_id: Optional[str], text: str) -> int:
     return int(h[:8], 16)
 
 # ----------------------------
-# Schemas (Pydantic v2)
+# Schemas (local for LLM I/O)
 # ----------------------------
 Category  = Literal["General", "Invoice", "Customer Requests", "Misc"]
 Priority  = Literal["High", "Medium", "Low"]
@@ -80,19 +80,13 @@ class InvoiceFields(BaseModel):
     account_name:   Optional[str] = None
     biller_code:    Optional[str] = None
     payment_reference: Optional[str] = None
-    description:    Optional[str] = None  # NEW
+    description:    Optional[str] = None
 
 class RequestSummary(BaseModel):
     summary: str
 
 # ----------------------------
-# Prompt helper
-# ----------------------------
-def _wrap_email_prompt(text: str) -> str:
-    return f"Email+attachments:\n{trim_text(text).strip()}\n"
-
-# ----------------------------
-# Robust JSON helpers
+# JSON helpers
 # ----------------------------
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
@@ -105,10 +99,6 @@ def _strip_code_fences(s: str) -> str:
     return s
 
 def _first_complete_json(s: str) -> Optional[str]:
-    """
-    Return the first complete top-level JSON object/array from s,
-    using brace/bracket counting with quote/escape handling.
-    """
     start_idx = None
     stack = []
     in_str = False
@@ -210,31 +200,52 @@ def _gen(
             raise RuntimeError(f"Model returned non-JSON: {raw[:200]}...")
 
 # ----------------------------
-# Tasks
+# Prompts
 # ----------------------------
-def classify_text(text: str, graph_id: Optional[str] = None) -> Classification:
-    prompt = _wrap_email_prompt(text) + """
-You are a strict JSON classifier.
+_ALLOWED_CATS = ["General", "Invoice", "Customer Requests", "Misc"]
+_ALLOWED_PRIOS = ["High", "Medium", "Low"]
 
-Allowed categories (choose exactly one):
+_CLASSIFY_INSTRUCTIONS = f"""
+You are a STRICT JSON classifier for business emails.
+
+Allowed categories (exactly one, case-sensitive):
 - General
 - Invoice
 - Customer Requests
 - Misc
 
-Priority (choose one): High, Medium, Low.
+Allowed priorities:
+- High
+- Medium
+- Low
+
+Rules:
+- Consider the ENTIRE email body AND any attachment text included in the prompt.
+- Always start the "Category" with an Uppercase letter for each word and do not use plurals.
+- Decide by context; do not rely on single keywords.
+- Never invent information not present in the text.
+- If the email clearly concerns invoices/billing/payments/payable or contains payment instructions or terms → "Invoice".
+- If a person/customer is asking for help/action/support NOT clearly an invoice → "Customer Requests".
+- Automated notifications / other unrelated → "Misc".
+- Otherwise → "General".
+- "Invoice" Category should always be "High" Priority.
+- Priority "High" only when urgency/deadline is explicit (e.g., "urgent", "asap", "immediately", "critical").
+{json.dumps(_ALLOWED_CATS)}
+
+Allowed priorities (choose exactly one, with EXACT casing):
+{json.dumps(_ALLOWED_PRIOS)}
+
+Priority rule of thumb:
 - Use "High" ONLY if explicit urgency words appear: "urgent", "asap", "immediate", "critical", "priority: high".
 - If a due date/time is present WITHOUT those words → "Medium".
 - Otherwise → "Low".
 
-Return only the JSON object matching the schema.
+Return only this JSON object:
+{{"category": <one of {_ALLOWED_CATS}>, "priority": <one of {_ALLOWED_PRIOS}>}}
 """
-    data = _gen(CLASSIFIER_MODEL, prompt, Classification, seed=_det_seed(graph_id, text))
-    return Classification(**data)
 
-def extract_invoice(text: str, graph_id: Optional[str] = None) -> InvoiceFields:
-    prompt = _wrap_email_prompt(text) + """
-Extract invoice details strictly from the text. Do not guess.
+_INVOICE_INSTRUCTIONS = """
+Extract invoice details strictly from the text provided (email + attachments). Do not guess.
 If a field isn't present, set it to null.
 Keep numbers/strings exactly as they appear (no reformatting).
 
@@ -258,20 +269,96 @@ Return JSON with these keys ONLY:
 - payment_reference
 - description
 """
-    data = _gen(
-        INVOICE_MODEL,
-        prompt,
-        InvoiceFields,
-        seed=_det_seed(graph_id, text),
-        num_predict_override=INVOICE_NUM_PREDICT,  # bigger cap for invoices
-    )
-    return InvoiceFields(**data)
 
-def extract_customer_request_summary(text: str, graph_id: Optional[str] = None) -> RequestSummary:
-    prompt = _wrap_email_prompt(text) + """
+_REQUEST_INSTRUCTIONS = """
 Summarize the customer's request in 2–3 sentences (plain English, no assumptions).
 Return JSON with only:
 { "summary": string }
 """
-    data = _gen(REQUEST_MODEL, prompt, RequestSummary, seed=_det_seed(graph_id, text))
+
+# ----------------------------
+# Public tasks
+# ----------------------------
+def classify_text(text: str, graph_id: Optional[str] = None) -> Classification:
+    # Keep classification fast by capping input smaller
+    text_small = trim_text(text, MAX_CHARS_CLASSIFY)
+    prompt = f"{text_small}\n\n{_CLASSIFY_INSTRUCTIONS}"
+    data = _gen(CLASSIFIER_MODEL, prompt, Classification, seed=_det_seed(graph_id, text_small))
+    # Hard guard: ensure Title Case and valid values
+    category = title_case(data.get("category"))
+    priority = title_case(data.get("priority"))
+    if category not in _ALLOWED_CATS:
+        # try to coerce common variants
+        low = (category or "").lower()
+        if low.startswith("invoice"):
+            category = "Invoice"
+        elif low.startswith("customer request"):
+            category = "Customer Requests"
+        elif "misc" in low:
+            category = "Misc"
+        else:
+            category = "General"
+    if priority not in _ALLOWED_PRIOS:
+        priority = "Low"
+    return Classification(category=category, priority=priority)
+
+def extract_invoice(text: str, graph_id: Optional[str] = None) -> InvoiceFields:
+    # Use larger cap for extraction
+    text_big = trim_text(text, MAX_CHARS_EXTRACT)
+    prompt = f"{text_big}\n\n{_INVOICE_INSTRUCTIONS}"
+    data = _gen(
+        INVOICE_MODEL,
+        prompt,
+        InvoiceFields,
+        seed=_det_seed(graph_id, text_big),
+        num_predict_override=INVOICE_NUM_PREDICT,
+    )
+    inv = InvoiceFields(**data)
+
+    # Fallback: if too few fields present, run regex extractor and merge
+    present = [k for k, v in inv.model_dump().items() if v]
+    if len(present) <= 2:
+        fallback = _fallback_invoice_parse(text_big)
+        merged = inv.model_dump()
+        for k, v in fallback.items():
+            if not merged.get(k) and v:
+                merged[k] = v
+        inv = InvoiceFields(**merged)
+
+    return inv
+
+def extract_customer_request_summary(text: str, graph_id: Optional[str] = None) -> RequestSummary:
+    text_big = trim_text(text, MAX_CHARS_EXTRACT)
+    prompt = f"{text_big}\n\n{_REQUEST_INSTRUCTIONS}"
+    data = _gen(REQUEST_MODEL, prompt, RequestSummary, seed=_det_seed(graph_id, text_big))
+    # Safety trim
+    data["summary"] = (data.get("summary") or "").strip()
     return RequestSummary(**data)
+
+# ----------------------------
+# Regex fallback for invoices
+# ----------------------------
+_NUM = r"[0-9][0-9,]*"
+_AMT = rf"(?:{_NUM}(?:\.\d{{2}})?)"
+
+def _search(pattern: str, text: str, flags=re.I):
+    m = re.search(pattern, text, flags)
+    return m.group(1).strip() if m else None
+
+def _fallback_invoice_parse(text: str) -> Dict[str, Optional[str]]:
+    fields: Dict[str, Optional[str]] = {
+        "invoice_number": _search(r"\bInvoice(?:\s*(?:No\.?|#|Number))?[:\-\s]*([A-Za-z0-9\-\/]+)", text),
+        "invoice_date":   _search(r"\bInvoice\s*Date[:\-\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})", text)
+                          or _search(r"\bDate[:\-\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})", text),
+        "due_date":       _search(r"\b(?:Due\s*Date|Payment\s*Due)[:\-\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})", text),
+        "invoice_amount": _search(r"\b(?:Total(?:\s*(?:Due|Amount))?|Amount\s*Due)[:\-\s]*\$?\s*(" + _AMT + r")", text),
+        "payment_link":   _search(r"(https?://\S+)", text),
+        "bsb":            _search(r"\bBSB[:\s\-]*([0-9]{3}[-\s]?[0-9]{3})\b", text),
+        "account_number": _search(r"\bAccount(?:\s*Number)?[:\s\-]*([0-9 ]{6,})", text),
+        "account_name":   _search(r"\bAccount\s*Name[:\s\-]*([A-Za-z0-9 &\.\-]{2,})", text),
+        "biller_code":    _search(r"\bBiller\s*Code[:\s\-]*([0-9]{4,})", text),
+        "payment_reference": _search(r"\b(?:Payment\s*)?Reference[:\s\-]*([A-Za-z0-9\-]{3,})", text),
+        # description is tricky; take first "Description|Particulars|For" line if present
+        "description":    _search(r"\b(?:Description|Particulars|For)[:\s\-]*(.+)", text),
+    }
+    return fields

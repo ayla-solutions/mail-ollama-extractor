@@ -1,214 +1,234 @@
 """
-mail-ollama-extractor (fully instrumented)
-------------------------------------------
-Receives a combined plain-text "email + attachments" body and optional subject/received_at/graph_id.
-Steps:
-  1) Validate & trim input; include Subject in prompt if provided.
-  2) Classify deterministically via Ollama → {category, priority}.
-  3) If Invoice      → extract invoice fields (incl. description).
-     If Cust.Request → summarize + compute deterministic ticket number.
-  4) Return JSON only. No persistence here.
+FastAPI service: mail-ollama-extractor
 
-This version adds:
-- Per-request correlation id (request_id) + optional graph_id correlation
-- Detailed timings for classify/extract blocks
-- Payload size + first-N char previews (safe) for debugging
-- Clear error paths with structured logs
+Upgrades:
+- New /classify endpoint (fast path).
+- /extract now composes text from subject + body + attachments, classifies first,
+  then conditionally performs heavy extraction.
+- Strict, sentence-case categories/priorities with robust fallbacks.
+- Structured JSON logging (minimal, no raw content).
 """
+
+from __future__ import annotations
 
 import os
 import time
-import uuid
-import hashlib
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from schemas import ExtractIn, ExtractOut
+from schemas import ExtractIn, ExtractOut, InvoiceFields, RequestFields
 from llm import classify_text, extract_invoice, extract_customer_request_summary
-from utils import trim_text, yyyymmdd_from_iso, compute_ticket
-
-# ------------------------------------------------------------------------------
-# Config & Logging
-# ------------------------------------------------------------------------------
-load_dotenv()
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+from utils import (
+    trim_text,
+    yyyymmdd_from_iso,
+    compute_ticket,
+    sha256_8,
+    compose_email_text,
+    title_case,
+    log_event,
+    MAX_CHARS_CLASSIFY,
+    MAX_CHARS_EXTRACT,
 )
+
+# ----------------------------
+# Bootstrap
+# ----------------------------
+load_dotenv()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("mail-ollama-extractor")
 
-PREVIEW_CHARS = int(os.getenv("LOG_PREVIEW_CHARS", "280"))
-SLOW_CLASSIFY_MS = int(os.getenv("SLOW_CLASSIFY_MS", "3000"))
-SLOW_INVOICE_MS  = int(os.getenv("SLOW_INVOICE_MS", "5000"))
-SLOW_SUMMARY_MS  = int(os.getenv("SLOW_SUMMARY_MS", "4000"))
+# Slow-call thresholds (ms)
+SLOW_CLASSIFY_WARN_MS = int(os.getenv("SLOW_CLASSIFY_WARN_MS", "20000"))
+SLOW_INVOICE_WARN_MS = int(os.getenv("SLOW_INVOICE_WARN_MS", "25000"))
+SLOW_REQUEST_WARN_MS = int(os.getenv("SLOW_REQUEST_WARN_MS", "15000"))
 
-def _preview(s: str | None, lim: int = PREVIEW_CHARS) -> Dict[str, Any]:
-    if not s:
-        return {"len": 0, "preview": ""}
-    s = s.strip()
-    return {"len": len(s), "preview": (s[:lim] + ("…" if len(s) > lim else ""))}
+# ----------------------------
+# Canonical categories / priorities
+# ----------------------------
+_ALLOWED_CATS = {"General", "Invoice", "Customer Requests", "Misc"}
+_ALLOWED_PRIOS = {"High", "Medium", "Low"}
 
-def _digest(s: str | None, n: int = 8) -> str:
-    """Small fingerprint to correlate inputs without logging full text."""
-    if not s:
-        return ""
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:n]
+def canon_category(raw: Optional[str]) -> str:
+    """
+    Map anything to one of the allowed categories, emit Title Case.
+    Handles plurals/casing variants.
+    """
+    key = (raw or "").strip().lower()
+    key_sing = key[:-1] if key.endswith("s") else key
+    if key.startswith("invoice"):
+        return "Invoice"
+    if key_sing in {"customer request", "customer request"} or "customer request" in key:
+        return "Customer Requests"
+    if key in {"misc", "miscellaneous"}:
+        return "Misc"
+    if key == "general":
+        return "General"
+    # default
+    return "General"
 
-app = FastAPI(title="mail-ollama-extractor (instrumented)", version="1.2.0")
+def canon_priority(raw: Optional[str]) -> str:
+    key = title_case(raw)
+    return key if key in _ALLOWED_PRIOS else "Low"
 
-# ------------------------------------------------------------------------------
-# Middleware: assign request_id and basic access log
-# ------------------------------------------------------------------------------
-@app.middleware("http")
-async def correlate_request(request: Request, call_next):
-    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-    start = time.perf_counter()
+# ----------------------------
+# FastAPI app
+# ----------------------------
+app = FastAPI(title="mail-ollama-extractor", version="2.0.0")
 
-    log.info(
-        "http_request_start",
-        extra={"request_id": rid, "method": request.method, "path": request.url.path, "query": str(request.url.query)},
-    )
-
-    try:
-        resp = await call_next(request)
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        log.info("http_request_end", extra={"request_id": rid, "status_code": resp.status_code, "elapsed_ms": elapsed_ms})
-        resp.headers["X-Request-ID"] = rid
-        return resp
-    except Exception:
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        log.exception("http_request_error", extra={"request_id": rid, "elapsed_ms": elapsed_ms})
-        return JSONResponse(status_code=500, content={"ok": False, "error": "Unhandled error in extractor"})
-
-# ------------------------------------------------------------------------------
-# Endpoints
-# ------------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "mail-ollama-extractor (instrumented)"}
+    return {"ok": True, "service": "mail-ollama-extractor"}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "preview_chars": PREVIEW_CHARS}
+    return {"ok": True}
 
-@app.post("/extract", response_model=ExtractOut)
-def extract(payload: ExtractIn):
-    """
-    Contract:
-      - body_text: REQUIRED (plain text of email + attachments)
-      - subject, received_at, graph_id: OPTIONAL (assist determinism & prompts)
-    """
-    # ---------- Validate ----------
-    if not payload.body_text or not payload.body_text.strip():
-        log.warning("bad_request_missing_body_text", extra={"graph_id": payload.graph_id})
+# ----------------------------
+# NEW: Classification only (fast)
+# ----------------------------
+@app.post("/classify")
+def classify_endpoint(payload: ExtractIn):
+    body_text_raw = (payload.body_text or "").strip()
+    if not body_text_raw:
         raise HTTPException(status_code=422, detail="body_text is required")
 
-    # ---------- Prepare text ----------
-    # limit size proactively (latency/cost control), add Subject if provided
-    body_text = trim_text(payload.body_text.strip())
-    text_for_prompt = body_text
-    if payload.subject:
-        text_for_prompt = f"Subject: {payload.subject}\n\n{body_text}"
+    subject = (payload.subject or "").strip()
+    graph_id = (payload.graph_id or "").strip()
+    att_texts: List[str] = payload.attachments_text or []
 
-    # Compute small fingerprints for debug without leaking full content
-    text_fp   = _digest(text_for_prompt)
-    subject_p = _preview(payload.subject)
-    body_p    = _preview(body_text)
+    # Compose minimal text for classification
+    text_small = compose_email_text(subject, trim_text(body_text_raw, MAX_CHARS_CLASSIFY), [])
+    t0 = time.monotonic()
+    cls = classify_text(text_small, graph_id=graph_id)
+    took = int((time.monotonic() - t0) * 1000)
 
-    log.info(
-        "extract_request_received",
-        extra={
-            "graph_id": payload.graph_id,
-            "text_fp": text_fp,
-            "subject": subject_p,
-            "body_text": body_p,
-            "received_at": payload.received_at,
-        },
+    cat = canon_category(getattr(cls, "category", None))
+    pri = canon_priority(getattr(cls, "priority", None))
+
+    log_event(
+        log,
+        "classify",
+        graph_id=graph_id or "-",
+        body_sha=sha256_8(body_text_raw),
+        took_ms=took,
+        category=cat,
+        priority=pri,
+        attachments=len(att_texts),
+        warn=took >= SLOW_CLASSIFY_WARN_MS,
     )
+    return {"ok": True, "data": {"category": cat, "priority": pri}}
 
-    out: Dict[str, Any] = {}
-    t0 = time.perf_counter()
-
+# ----------------------------
+# Full extraction (classify -> extract-if-needed)
+# ----------------------------
+@app.post("/extract", response_model=ExtractOut)
+def extract(payload: ExtractIn):
     try:
-        # ---------- Step 1: Classify ----------
-        c0 = time.perf_counter()
-        cls = classify_text(text_for_prompt, graph_id=payload.graph_id)
-        c1 = time.perf_counter()
-        cls_ms = int((c1 - c0) * 1000)
-        if cls_ms > SLOW_CLASSIFY_MS:
-            log.warning("slow_classify", extra={"graph_id": payload.graph_id, "elapsed_ms": cls_ms})
+        # Validate
+        body_text_raw = (payload.body_text or "").strip()
+        if not body_text_raw:
+            raise HTTPException(status_code=422, detail="body_text is required")
 
-        category = (cls.category or "").strip()
-        priority = (cls.priority or "").strip()
-        out.update({"category": category, "priority": priority})
+        subject = (payload.subject or "").strip()
+        graph_id = (payload.graph_id or "").strip()
+        received_at_iso = (payload.received_at or "").strip()
+        att_texts: List[str] = payload.attachments_text or []
 
-        log.info(
-            "classify_ok",
-            extra={
-                "graph_id": payload.graph_id,
-                "elapsed_ms": cls_ms,
-                "category": category,
-                "priority": priority,
-            },
+        # Quick classification on a smaller window
+        text_small = compose_email_text(subject, trim_text(body_text_raw, MAX_CHARS_CLASSIFY), [])
+        t0 = time.monotonic()
+        cls = classify_text(text_small, graph_id=graph_id)
+        classify_ms = int((time.monotonic() - t0) * 1000)
+
+        raw_cat = getattr(cls, "category", None)
+        raw_pri = getattr(cls, "priority", None)
+
+        cat = canon_category(raw_cat)
+        pri = canon_priority(raw_pri)
+
+        log_event(
+            log,
+            "classify_in_extract",
+            graph_id=graph_id or "-",
+            body_sha=sha256_8(body_text_raw),
+            took_ms=classify_ms,
+            category=cat,
+            priority=pri,
+            attachments=len(att_texts),
+            warn=classify_ms >= SLOW_CLASSIFY_WARN_MS,
         )
 
-        # ---------- Step 2: Per-category extraction ----------
-        cat_norm = category.lower()
-        if cat_norm in ("invoice", "invoices"):
-            i0 = time.perf_counter()
-            inv = extract_invoice(text_for_prompt, graph_id=payload.graph_id).model_dump()
-            i1 = time.perf_counter()
-            inv_ms = int((i1 - i0) * 1000)
-            if inv_ms > SLOW_INVOICE_MS:
-                log.warning("slow_invoice_extract", extra={"graph_id": payload.graph_id, "elapsed_ms": inv_ms})
+        out: Dict[str, Any] = {"category": cat, "priority": pri}
 
-            # Log which keys are present (not values)
-            present_keys = [k for k, v in inv.items() if v not in (None, "", [])]
-            out["invoice"] = inv
-
-            log.info(
-                "invoice_extract_ok",
-                extra={"graph_id": payload.graph_id, "elapsed_ms": inv_ms, "present_fields": present_keys},
+        # Only build the bigger prompt if needed
+        if cat == "Invoice" or cat == "invoice" or cat == "Invoices" or cat == "invoices":
+            text_big = compose_email_text(
+                subject,
+                trim_text(body_text_raw, MAX_CHARS_EXTRACT),
+                [trim_text(a, MAX_CHARS_EXTRACT) for a in att_texts if a],
             )
+            t2 = time.monotonic()
+            inv = extract_invoice(text_big, graph_id=graph_id)
+            inv_ms = int((time.monotonic() - t2) * 1000)
 
-        elif cat_norm in ("customer requests", "customer request"):
-            r0 = time.perf_counter()
-            summary = extract_customer_request_summary(text_for_prompt, graph_id=payload.graph_id).summary
-            r1 = time.perf_counter()
-            sum_ms = int((r1 - r0) * 1000)
-            if sum_ms > SLOW_SUMMARY_MS:
-                log.warning("slow_request_summary", extra={"graph_id": payload.graph_id, "elapsed_ms": sum_ms})
+            present = sorted([k for k, v in inv.model_dump().items() if v is not None])
+            log_event(
+                log,
+                "invoice_extract",
+                graph_id=graph_id or "-",
+                took_ms=inv_ms,
+                fields_present=len(present),
+                warn=inv_ms >= SLOW_INVOICE_WARN_MS,
+            )
+            out["invoice"] = inv.model_dump()
 
-            date_yyyymmdd = yyyymmdd_from_iso(payload.received_at)
-            ticket = compute_ticket(date_yyyymmdd=date_yyyymmdd, seed=(payload.graph_id or ""))
+        elif cat == "Customer Requests":
+            text_big = compose_email_text(
+                subject,
+                trim_text(body_text_raw, MAX_CHARS_EXTRACT),
+                [trim_text(a, MAX_CHARS_EXTRACT) for a in att_texts if a],
+            )
+            t4 = time.monotonic()
+            summary = extract_customer_request_summary(text_big, graph_id=graph_id).summary
+            sum_ms = int((time.monotonic() - t4) * 1000)
 
+            # Deterministic ticket number
+            date_yyyymmdd = yyyymmdd_from_iso(received_at_iso)
+            ticket = compute_ticket(date_yyyymmdd, seed=graph_id or "")
+
+            log_event(
+                log,
+                "request_extract",
+                graph_id=graph_id or "-",
+                took_ms=sum_ms,
+                ticket=ticket,
+                warn=sum_ms >= SLOW_REQUEST_WARN_MS,
+            )
             out["request"] = {"summary": summary, "ticket_number": ticket}
-            log.info(
-                "customer_request_ok",
-                extra={
-                    "graph_id": payload.graph_id,
-                    "elapsed_ms": sum_ms,
-                    "summary_len": len(summary or ""),
-                    "ticket_number": ticket,
-                },
-            )
+        else:
+            # General / Misc → no extra fields
+            log_event(log, "no_extraction_needed", graph_id=graph_id or "-", category=cat)
 
-        # general / misc → nothing else
-        t1 = time.perf_counter()
-        total_ms = int((t1 - t0) * 1000)
-        log.info(
-            "extract_ok",
-            extra={"graph_id": payload.graph_id, "total_elapsed_ms": total_ms, "category": out.get("category")},
+        log_event(
+            log,
+            "extract_done",
+            graph_id=graph_id or "-",
+            category=out.get("category"),
+            priority=out.get("priority"),
         )
         return {"ok": True, "data": out}
 
     except HTTPException:
         raise
     except Exception as e:
-        total_ms = int((time.perf_counter() - t0) * 1000)
-        log.exception("extract_fail", extra={"graph_id": payload.graph_id, "total_elapsed_ms": total_ms})
-        return JSONResponse(status_code=500, content={"ok": False, "error": f"Extractor failed: {e}"})
+        log_event(log, "extract_error", error=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": f"Extractor failed: {e}"},
+        )

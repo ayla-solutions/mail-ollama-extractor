@@ -2,18 +2,22 @@
 Pydantic schemas for request/response & LLM IO.
 """
 
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any, List
 from pydantic import BaseModel, Field
 
 # ----------------------------
 # Request from Mail Classification API
 # ----------------------------
 class ExtractIn(BaseModel):
-    body_text: str = Field(..., description="Combined plain text: email body + attachment text")
+    body_text: str = Field(..., description="Plain text of the email body")
+    # If you have OCR/parsed text from attachments, pass them here individually.
+    attachments_text: Optional[List[str]] = Field(
+        default=None, description="List of plain-text contents from attachments"
+    )
     # Optional pass-throughs (not used for reasoning; used for deterministic tickets/logging)
-    graph_id: Optional[str] = None        # Microsoft Graph message id
-    subject: Optional[str] = None         # Email subject (included in prompt)
-    received_at: Optional[str] = None     # ISO-8601 (used for ticket date)
+    graph_id: Optional[str] = Field(default=None, description="Microsoft Graph message id")
+    subject: Optional[str] = Field(default=None, description="Email subject")
+    received_at: Optional[str] = Field(default=None, description="ISO-8601 (used for ticket date)")
 
 # ----------------------------
 # Classifier result
@@ -39,7 +43,7 @@ class InvoiceFields(BaseModel):
     account_name: Optional[str] = None
     biller_code: Optional[str] = None
     payment_reference: Optional[str] = None
-    description: Optional[str] = None  # NEW
+    description: Optional[str] = None  # SHORT purpose-of-invoice
 
 # ----------------------------
 # Customer request (response shape)
