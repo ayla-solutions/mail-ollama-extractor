@@ -1,9 +1,9 @@
 """
-Ollama integration with strict JSON outputs and deterministic seeding.
-Upgrades:
-- Stronger classification prompt (exact allowed categories/priorities + casing).
-- Separate caps for classify vs extract (faster).
-- Invoice fallback regex parser to fill missing fields.
+    Ollama integration with strict JSON outputs and deterministic seeding.
+    Upgrades:
+    - Stronger classification prompt (exact allowed categories/priorities + casing).
+    - Separate caps for classify vs extract (faster).
+    - Invoice fallback regex parser to fill missing fields.
 """
 
 import json
@@ -197,10 +197,10 @@ def _gen(
             extracted = _first_complete_json(raw)
             if extracted:
                 return json.loads(extracted)
-            raise RuntimeError(f"Model returned non-JSON: {raw[:200]}...")
+            raise
 
 # ----------------------------
-# Prompts
+# Classification instructions
 # ----------------------------
 _ALLOWED_CATS = ["General", "Invoice", "Customer Requests", "Misc"]
 _ALLOWED_PRIOS = ["High", "Medium", "Low"]
@@ -220,25 +220,21 @@ Allowed priorities:
 - Low
 
 Rules:
-- Consider the ENTIRE email body AND any attachment text included in the prompt.
-- Always start the "Category" with an Uppercase letter for each word and do not use plurals.
-- Decide by context; do not rely on single keywords.
+- Read the ENTIRE email body AND any attachment text included in the prompt.
+- Use the exact casing shown above; do not use plurals.
+- Decide by context and content; do not rely on isolated keywords like “invoice” or “bill”.
 - Never invent information not present in the text.
-- If the email clearly concerns invoices/billing/payments/payable or contains payment instructions or terms → "Invoice".
-- If a person/customer is asking for help/action/support NOT clearly an invoice → "Customer Requests".
-- Automated notifications / other unrelated → "Misc".
-- Otherwise → "General".
-- "Invoice" Category should always be "High" Priority.
-- Priority "High" only when urgency/deadline is explicit (e.g., "urgent", "asap", "immediately", "critical").
-{json.dumps(_ALLOWED_CATS)}
 
-Allowed priorities (choose exactly one, with EXACT casing):
-{json.dumps(_ALLOWED_PRIOS)}
+Category guidelines:
+- “Invoice”: choose this category only if the email clearly contains **at least three** invoice‑specific cues.  Examples of cues include: (a) an attached invoice or bill document; (b) an explicit invoice number or reference; (c) an invoice date or due date; (d) a total amount or amount due; (e) payment instructions or bank/account details.  If fewer than three of these cues are present—even if the words “invoice” or “payment” appear—do **not** choose “Invoice”; instead classify as “General” or “Misc” as appropriate.
+- “Customer Requests”: the sender is asking for help, information or action that is not a bill; e.g., support tickets, queries, complaints or account changes.
+- “Misc”: automated notifications, marketing emails or system alerts that are unrelated to customer service or billing.
+- Otherwise → “General”.
 
-Priority rule of thumb:
-- Use "High" ONLY if explicit urgency words appear: "urgent", "asap", "immediate", "critical", "priority: high".
-- If a due date/time is present WITHOUT those words → "Medium".
-- Otherwise → "Low".
+Priority guidelines:
+- Use “High” **ONLY** if the email explicitly expresses urgency (e.g., “urgent”, “asap”, “immediately”, “critical”) or there is a due date that is imminent.
+- Use “Medium” when there is a due date/time but no explicit urgency words.
+- Otherwise → “Low”.
 
 Return only this JSON object:
 {{"category": <one of {_ALLOWED_CATS}>, "priority": <one of {_ALLOWED_PRIOS}>}}
@@ -351,14 +347,13 @@ def _fallback_invoice_parse(text: str) -> Dict[str, Optional[str]]:
         "invoice_date":   _search(r"\bInvoice\s*Date[:\-\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})", text)
                           or _search(r"\bDate[:\-\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})", text),
         "due_date":       _search(r"\b(?:Due\s*Date|Payment\s*Due)[:\-\s]*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})", text),
-        "invoice_amount": _search(r"\b(?:Total(?:\s*(?:Due|Amount))?|Amount\s*Due)[:\-\s]*\$?\s*(" + _AMT + r")", text),
+        "invoice_amount": _search(r"\b(?:Total\s*Due|Total\s*Amount|Amount\s*Due)[:\-\s]*(\$?\s*" + _AMT + ")", text),
         "payment_link":   _search(r"(https?://\S+)", text),
-        "bsb":            _search(r"\bBSB[:\s\-]*([0-9]{3}[-\s]?[0-9]{3})\b", text),
-        "account_number": _search(r"\bAccount(?:\s*Number)?[:\s\-]*([0-9 ]{6,})", text),
-        "account_name":   _search(r"\bAccount\s*Name[:\s\-]*([A-Za-z0-9 &\.\-]{2,})", text),
-        "biller_code":    _search(r"\bBiller\s*Code[:\s\-]*([0-9]{4,})", text),
-        "payment_reference": _search(r"\b(?:Payment\s*)?Reference[:\s\-]*([A-Za-z0-9\-]{3,})", text),
-        # description is tricky; take first "Description|Particulars|For" line if present
-        "description":    _search(r"\b(?:Description|Particulars|For)[:\s\-]*(.+)", text),
+        "bsb":            _search(r"\bBSB[:\-\s]*([0-9]{3}[- ]?[0-9]{3})", text),
+        "account_number": _search(r"\bAccount\s*Number[:\-\s]*([0-9]{5,})", text),
+        "account_name":   _search(r"\bAccount\s*Name[:\-\s]*([^\n]+)", text),
+        "biller_code":    _search(r"\bBiller\s*Code[:\-\s]*([0-9]+)", text),
+        "payment_reference": _search(r"\bPayment\s*Reference[:\-\s]*([A-Za-z0-9\-]+)", text),
+        "description":    None,  # description has to come from LLM; fallback can't infer
     }
     return fields
